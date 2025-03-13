@@ -1,0 +1,70 @@
+diff --git a/original/trap.c b/project/trap.c
+index 41c66eb..d89ce33 100644
+--- a/original/trap.c
++++ b/project/trap.c
+@@ -6,7 +6,8 @@
+ #include "proc.h"
+ #include "x86.h"
+ #include "traps.h"
+-#include "spinlock.h"
++#include "kalloc.h"
++
+ 
+ // Interrupt descriptor table (shared by all CPUs).
+ struct gatedesc idt[256];
+@@ -14,6 +15,29 @@ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
+ struct spinlock tickslock;
+ uint ticks;
+ 
++static pte_t *
++walkpgdir(pde_t *pgdir, const void *va, int alloc)
++{
++  pde_t *pde;
++  pte_t *pgtab;
++
++  pde = &pgdir[PDX(va)];
++  if(*pde & PTE_P){
++    pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
++  } else {
++    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
++      return 0;
++    // Make sure all those PTE_P bits are zero.
++    memset(pgtab, 0, PGSIZE);
++    // The permissions here are overly generous, but they can
++    // be further restricted by the permissions in the page table
++    // entries, if necessary.
++    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
++  }
++  return &pgtab[PTX(va)];
++}
++
++
+ void
+ tvinit(void)
+ {
+@@ -45,6 +69,25 @@ trap(struct trapframe *tf)
+       exit();
+     return;
+   }
++  if (tf->trapno == T_PGFLT) {  // Page fault
++    uint va = rcr2(); // Faulting virtual address
++    pte_t *pte = walkpgdir(myproc()->pgdir, (void*)va, 0);
++
++    if (pte && (*pte & PTE_COW)) {  // Check if it's a COW page
++      char *mem = kalloc();
++      if (mem == 0)
++        panic("Out of memory");
++
++      memmove(mem, (char*)P2V(PTE_ADDR(*pte)), PGSIZE); // Copy old page data
++      acquire(&kmem.lock);
++      *pte = V2P(mem) | PTE_U | PTE_W | PTE_P; // Update page table entry
++      acquire(&kmem.lock);
++      
++      decref((char*)P2V(PTE_ADDR(*pte))); // Decrease reference count of old page
++      
++      return;
++    }
++  }
+ 
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:

@@ -1,0 +1,7 @@
+diff --git a/project/vm.h b/project/vm.h
+new file mode 100644
+index 0000000..cb949da
+--- /dev/null
++++ b/project/vm.h
+@@ -0,0 +1 @@
++static pte_t * walkpgdir(pde_t *pgdir, const void *va, int alloc);

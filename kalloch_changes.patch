@@ -1,0 +1,23 @@
+diff --git a/project/kalloc.h b/project/kalloc.h
+new file mode 100644
+index 0000000..0b0fa2c
+--- /dev/null
++++ b/project/kalloc.h
+@@ -0,0 +1,17 @@
++#ifndef KALLOC_H
++#define KALLOC_H
++
++
++#include "spinlock.h"
++struct kmem {
++  struct spinlock lock;
++  int use_lock;
++  int refcount[PHYSTOP / PGSIZE];
++  struct run *freelist;
++};
++
++extern struct kmem kmem;
++
++extern int kref[PHYSTOP / PGSIZE];
++
++#endif

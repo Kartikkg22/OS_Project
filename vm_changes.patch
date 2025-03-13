@@ -1,0 +1,48 @@
+diff --git a/original/vm.c b/project/vm.c
+index 7134cff..d13e7f5 100644
+--- a/original/vm.c
++++ b/project/vm.c
+@@ -6,6 +6,8 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "elf.h"
++#include "kalloc.h" 
++
+ 
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+@@ -329,20 +331,26 @@ copyuvm(pde_t *pgdir, uint sz)
+       panic("copyuvm: page not present");
+     pa = PTE_ADDR(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto bad;
+-    memmove(mem, (char*)P2V(pa), PGSIZE);
+-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+-      kfree(mem);
++    if (flags & PTE_W) {
++      flags &= ~PTE_W;  // Remove write permission
++      flags |= PTE_COW; // Set COW flag
++    }
++
++    // Map the page in the new process
++    if (mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+       goto bad;
++    
++    // Increment reference count for shared page
++    acquire(&kmem.lock);
++    kref[pa / PGSIZE]++;
++    release(&kmem.lock);
+     }
+-  }
+-  return d;
++    return d;
+ 
+ bad:
+   freevm(d);
+   return 0;
+-}
++  }
+ 
+ //PAGEBREAK!
+ // Map user virtual address to kernel address.

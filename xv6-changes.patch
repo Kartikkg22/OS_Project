@@ -1,0 +1,222 @@
+diff --git a/original/vm.c b/project/vm.c
+index 7134cff..d13e7f5 100644
+--- a/original/vm.c
++++ b/project/vm.c
+@@ -6,6 +6,8 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "elf.h"
++#include "kalloc.h" 
++
+ 
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+@@ -329,20 +331,26 @@ copyuvm(pde_t *pgdir, uint sz)
+       panic("copyuvm: page not present");
+     pa = PTE_ADDR(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto bad;
+-    memmove(mem, (char*)P2V(pa), PGSIZE);
+-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
+-      kfree(mem);
++    if (flags & PTE_W) {
++      flags &= ~PTE_W;  // Remove write permission
++      flags |= PTE_COW; // Set COW flag
++    }
++
++    // Map the page in the new process
++    if (mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+       goto bad;
++    
++    // Increment reference count for shared page
++    acquire(&kmem.lock);
++    kref[pa / PGSIZE]++;
++    release(&kmem.lock);
+     }
+-  }
+-  return d;
++    return d;
+ 
+ bad:
+   freevm(d);
+   return 0;
+-}
++  }
+ 
+ //PAGEBREAK!
+ // Map user virtual address to kernel address.
+diff --git a/project/vm.h b/project/vm.h
+new file mode 100644
+index 0000000..cb949da
+--- /dev/null
++++ b/project/vm.h
+@@ -0,0 +1 @@
++static pte_t * walkpgdir(pde_t *pgdir, const void *va, int alloc);
+diff --git a/original/kalloc.c b/project/kalloc.c
+index 14cd4f4..de4de66 100644
+--- a/original/kalloc.c
++++ b/project/kalloc.c
+@@ -1,13 +1,18 @@
+ // Physical memory allocator, intended to allocate
+ // memory for user processes, kernel stacks, page table pages,
+ // and pipe buffers. Allocates 4096-byte pages.
+-
+ #include "types.h"
+ #include "defs.h"
+ #include "param.h"
+ #include "memlayout.h"
+ #include "mmu.h"
+-#include "spinlock.h"
++#include "kalloc.h"
++
++// Initialization happens in two phases.
++// 1. main() calls kinit1() while still using entrypgdir to place just
++// the pages mapped by entrypgdir on free list.
++// 2. main() calls kinit2() with the rest of the physical pages
++// after installing a full page table that maps them on all cores.
+ 
+ void freerange(void *vstart, void *vend);
+ extern char end[]; // first address after kernel loaded from ELF file
+@@ -16,18 +21,25 @@ extern char end[]; // first address after kernel loaded from ELF file
+ struct run {
+   struct run *next;
+ };
++struct kmem kmem;
++int kref[PHYSTOP / PGSIZE];
+ 
+-struct {
+-  struct spinlock lock;
+-  int use_lock;
+-  struct run *freelist;
+-} kmem;
++void incref(char *pa) {
++  acquire(&kmem.lock);
++  kmem.refcount[V2P(pa) / PGSIZE]++;  // Increase ref count
++  release(&kmem.lock);
++}
++
++void decref(char *pa) {
++  acquire(&kmem.lock);
++  int ref = --kmem.refcount[V2P(pa) / PGSIZE]; // Decrease ref count
++  release(&kmem.lock);
++  
++  if (ref == 0) {
++    kfree(pa);  // Free memory when refcount reaches 0
++  }
++}
+ 
+-// Initialization happens in two phases.
+-// 1. main() calls kinit1() while still using entrypgdir to place just
+-// the pages mapped by entrypgdir on free list.
+-// 2. main() calls kinit2() with the rest of the physical pages
+-// after installing a full page table that maps them on all cores.
+ void
+ kinit1(void *vstart, void *vend)
+ {
+@@ -91,6 +103,12 @@ kalloc(void)
+     kmem.freelist = r->next;
+   if(kmem.use_lock)
+     release(&kmem.lock);
++  if (r) {
++    memset((char*)r, 0, PGSIZE);
++    acquire(&kmem.lock);
++    kmem.refcount[V2P((char*)r) / PGSIZE] = 1;  // Initialize refcount to 1
++    release(&kmem.lock);
++  }  
+   return (char*)r;
+ }
+ 
+diff --git a/project/kalloc.h b/project/kalloc.h
+new file mode 100644
+index 0000000..0b0fa2c
+--- /dev/null
++++ b/project/kalloc.h
+@@ -0,0 +1,17 @@
++#ifndef KALLOC_H
++#define KALLOC_H
++
++
++#include "spinlock.h"
++struct kmem {
++  struct spinlock lock;
++  int use_lock;
++  int refcount[PHYSTOP / PGSIZE];
++  struct run *freelist;
++};
++
++extern struct kmem kmem;
++
++extern int kref[PHYSTOP / PGSIZE];
++
++#endif
+diff --git a/original/trap.c b/project/trap.c
+index 41c66eb..d89ce33 100644
+--- a/original/trap.c
++++ b/project/trap.c
+@@ -6,7 +6,8 @@
+ #include "proc.h"
+ #include "x86.h"
+ #include "traps.h"
+-#include "spinlock.h"
++#include "kalloc.h"
++
+ 
+ // Interrupt descriptor table (shared by all CPUs).
+ struct gatedesc idt[256];
+@@ -14,6 +15,29 @@ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
+ struct spinlock tickslock;
+ uint ticks;
+ 
++static pte_t *
++walkpgdir(pde_t *pgdir, const void *va, int alloc)
++{
++  pde_t *pde;
++  pte_t *pgtab;
++
++  pde = &pgdir[PDX(va)];
++  if(*pde & PTE_P){
++    pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
++  } else {
++    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
++      return 0;
++    // Make sure all those PTE_P bits are zero.
++    memset(pgtab, 0, PGSIZE);
++    // The permissions here are overly generous, but they can
++    // be further restricted by the permissions in the page table
++    // entries, if necessary.
++    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
++  }
++  return &pgtab[PTX(va)];
++}
++
++
+ void
+ tvinit(void)
+ {
+@@ -45,6 +69,25 @@ trap(struct trapframe *tf)
+       exit();
+     return;
+   }
++  if (tf->trapno == T_PGFLT) {  // Page fault
++    uint va = rcr2(); // Faulting virtual address
++    pte_t *pte = walkpgdir(myproc()->pgdir, (void*)va, 0);
++
++    if (pte && (*pte & PTE_COW)) {  // Check if it's a COW page
++      char *mem = kalloc();
++      if (mem == 0)
++        panic("Out of memory");
++
++      memmove(mem, (char*)P2V(PTE_ADDR(*pte)), PGSIZE); // Copy old page data
++      acquire(&kmem.lock);
++      *pte = V2P(mem) | PTE_U | PTE_W | PTE_P; // Update page table entry
++      acquire(&kmem.lock);
++      
++      decref((char*)P2V(PTE_ADDR(*pte))); // Decrease reference count of old page
++      
++      return;
++    }
++  }
+ 
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:
