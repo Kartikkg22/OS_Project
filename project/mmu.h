@@ -90,16 +90,12 @@ struct segdesc {
 #define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
 #define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
 
-// Page table entry flags.
+// Page table/directory entry flags.
 #define PTE_P           0x001   // Present
 #define PTE_W           0x002   // Writeable
 #define PTE_U           0x004   // User
 #define PTE_PS          0x080   // Page Size
-#define PTE_R		0x010	//Readable
-#define PTE_V		0x008	//Valid
-#define PTE2PA(pte)  ((pte) & ~0xFFF)
-
-
+#define PTE_COW		0x800	//Custom flag for making COW pages
 
 // Address in page table or page directory entry
 #define PTE_ADDR(pte)   ((uint)(pte) & ~0xFFF)

@@ -1,34 +1,45 @@
 // Physical memory allocator, intended to allocate
 // memory for user processes, kernel stacks, page table pages,
 // and pipe buffers. Allocates 4096-byte pages.
-
 #include "types.h"
 #include "defs.h"
 #include "param.h"
 #include "memlayout.h"
 #include "mmu.h"
-#include "spinlock.h"
-
-void freerange(void *vstart, void *vend);
-extern char end[]; // first address after kernel loaded from ELF file
-                   // defined by the kernel linker script in kernel.ld
-extern int refcount[];
-
-struct run {
-  struct run *next;
-};
-
-struct {
-  struct spinlock lock;
-  int use_lock;
-  struct run *freelist;
-} kmem;
+#include "kalloc.h"
 
 // Initialization happens in two phases.
 // 1. main() calls kinit1() while still using entrypgdir to place just
 // the pages mapped by entrypgdir on free list.
 // 2. main() calls kinit2() with the rest of the physical pages
 // after installing a full page table that maps them on all cores.
+
+void freerange(void *vstart, void *vend);
+extern char end[]; // first address after kernel loaded from ELF file
+                   // defined by the kernel linker script in kernel.ld
+
+struct run {
+  struct run *next;
+};
+struct kmem kmem;
+int kref[PHYSTOP / PGSIZE];
+
+void incref(char *pa) {
+  acquire(&kmem.lock);
+  kmem.refcount[V2P(pa) / PGSIZE]++;  // Increase ref count
+  release(&kmem.lock);
+}
+
+void decref(char *pa) {
+  acquire(&kmem.lock);
+  int ref = --kmem.refcount[V2P(pa) / PGSIZE]; // Decrease ref count
+  release(&kmem.lock);
+  
+  if (ref == 0) {
+    kfree(pa);  // Free memory when refcount reaches 0
+  }
+}
+
 void
 kinit1(void *vstart, void *vend)
 {
@@ -88,26 +99,16 @@ kalloc(void)
   if(kmem.use_lock)
     acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r){
+  if(r)
     kmem.freelist = r->next;
-    uint pa = (uint)r;
-    refcount[pa / PGSIZE] = 1;
-    memset((char*)r, 0, PGSIZE);  
-  }
   if(kmem.use_lock)
     release(&kmem.lock);
+  if (r) {
+    memset((char*)r, 0, PGSIZE);
+    acquire(&kmem.lock);
+    kmem.refcount[V2P((char*)r) / PGSIZE] = 1;  // Initialize refcount to 1
+    release(&kmem.lock);
+  }  
   return (char*)r;
 }
-
-void inc_refcount(uint pa) {
-  refcount[pa / PGSIZE]++;
-}
-
-void dec_refcount(uint pa) {
-  if (--refcount[pa / PGSIZE] == 0) {
-    // If last reference, free the page
-    kfree((char*)P2V(pa));  // Convert physical address to virtual
-  }
-}
-
 

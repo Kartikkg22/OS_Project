@@ -6,7 +6,6 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
-#include "vm.c"
 
 struct {
   struct spinlock lock;
@@ -178,61 +177,6 @@ growproc(int n)
 // Create a new process copying p as the parent.
 // Sets up stack to return as if from system call.
 // Caller must set state of returned proc to RUNNABLE.
-
-void freeuvm(uint pagetable, uint sz) {
-  uint va;
-  pte_t *pte;
-
-  // Free all the pages.
-  for (va = 0; va < sz; va += PGSIZE) {
-    pte = walk(pagetable, va, 0);  // Get the page table entry for the virtual address
-    if (pte == 0 || (*pte & PTE_V) == 0) {
-      continue;  // No valid mapping, skip
-    }
-    
-    uint pa = PTE2PA(*pte);  // Get the physical address
-    uvmunmap(pagetable, va, 1, 1);  // Unmap the page from the process's address space
-    dec_refcount(pa);  // Decrement the reference count for the physical page
-  }
-}
-
-uint proc_pagetable(struct proc *p) {
-    return p->pgdir;
-}
-
-
-int cowfork(struct proc *np, struct proc *curproc)
-{
-    uint va;
-    pte_t *pte;
-    
-    if ((np->pgdir = proc_pagetable(np)) == 0)
-        return -1;
-
-    for (va = 0; va < curproc->sz; va += PGSIZE) {
-        if ((pte = walk(curproc->pgdir, va, 0)) == 0)
-            panic("cowfork: PTE should exist");
-
-        if ((*pte & PTE_V) == 0)
-            continue;
-
-        uint pa = PTE2PA(*pte);
-
-        // Mark the page as read-only in both parent and child
-        *pte &= ~PTE_W;
-        if (mappages(np->pgdir, va, PGSIZE, pa, PTE_R | PTE_U | PTE_V) < 0) {
-            panic("cowfork: mappages failed");
-            return -1;
-        }
-
-        // Increase reference count
-        inc_refcount(pa);
-    }
-
-    return 0;
-}
-
-
 int
 fork(void)
 {
@@ -246,7 +190,7 @@ fork(void)
   }
 
   // Copy process state from proc.
-  if(cowfork(np, curproc) < 0){
+  if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
     kfree(np->kstack);
     np->kstack = 0;
     np->state = UNUSED;
@@ -304,7 +248,6 @@ exit(void)
   curproc->cwd = 0;
 
   acquire(&ptable.lock);
-  freeuvm(curproc->pgdir, curproc->sz);
 
   // Parent might be sleeping in wait().
   wakeup1(curproc->parent);
@@ -589,4 +532,3 @@ procdump(void)
     cprintf("\n");
   }
 }
-

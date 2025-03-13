@@ -56,6 +56,3 @@ struct proc {
 //   original data and bss
 //   fixed-size stack
 //   expandable heap
-
-uint proc_pagetable(struct proc *p);
-

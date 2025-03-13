@@ -6,6 +6,8 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "kalloc.h" 
+
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -329,20 +331,26 @@ copyuvm(pde_t *pgdir, uint sz)
       panic("copyuvm: page not present");
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+    if (flags & PTE_W) {
+      flags &= ~PTE_W;  // Remove write permission
+      flags |= PTE_COW; // Set COW flag
     }
-  }
-  return d;
+
+    // Map the page in the new process
+    if (mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+      goto bad;
+    
+    // Increment reference count for shared page
+    acquire(&kmem.lock);
+    kref[pa / PGSIZE]++;
+    release(&kmem.lock);
+    }
+    return d;
 
 bad:
   freevm(d);
   return 0;
-}
+  }
 
 //PAGEBREAK!
 // Map user virtual address to kernel address.
@@ -391,33 +399,4 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
 // Blank page.
 //PAGEBREAK!
 // Blank page.
-
-pte_t *walk(uint pagetable, uint va, int alloc) {
-    pte_t *pte;
-    pde_t *pde;
-
-    // walk the page table (simplified example)
-    pde = &pagetable[PDX(va)];
-    if (*pde & PTE_V) {
-        pte = (pte_t*)P2V(PTE2PA(*pde));
-        return &pte[PTX(va)];
-    }
-    return 0;
-}
-
-int mappages(uint pagetable, uint va, uint size, uint pa, int perm) {
-    // Map the pages in the page table (simplified example)
-    pte_t *pte;
-    for (; size > 0; va += PGSIZE, pa += PGSIZE, size -= PGSIZE) {
-        pte = walk(pagetable, va, 1);  // alloc = 1 means allocate the page table if not found
-        if (pte == 0)
-            return -1;
-        *pte = PA2PTE(pa) | perm;  // set permissions and map to physical address
-    }
-    return 0;
-}
-
-void inc_refcount(uint pa) {
-    refcount[pa / PGSIZE]++;
-}
 

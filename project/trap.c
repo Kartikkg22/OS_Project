@@ -6,13 +6,37 @@
 #include "proc.h"
 #include "x86.h"
 #include "traps.h"
-#include "spinlock.h"
+#include "kalloc.h"
+
 
 // Interrupt descriptor table (shared by all CPUs).
 struct gatedesc idt[256];
 extern uint vectors[];  // in vectors.S: array of 256 entry pointers
 struct spinlock tickslock;
 uint ticks;
+
+static pte_t *
+walkpgdir(pde_t *pgdir, const void *va, int alloc)
+{
+  pde_t *pde;
+  pte_t *pgtab;
+
+  pde = &pgdir[PDX(va)];
+  if(*pde & PTE_P){
+    pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
+  } else {
+    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
+      return 0;
+    // Make sure all those PTE_P bits are zero.
+    memset(pgtab, 0, PGSIZE);
+    // The permissions here are overly generous, but they can
+    // be further restricted by the permissions in the page table
+    // entries, if necessary.
+    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
+  }
+  return &pgtab[PTX(va)];
+}
+
 
 void
 tvinit(void)
@@ -36,7 +60,6 @@ idtinit(void)
 void
 trap(struct trapframe *tf)
 {
-  struct proc *p = myproc();
   if(tf->trapno == T_SYSCALL){
     if(myproc()->killed)
       exit();
@@ -45,6 +68,25 @@ trap(struct trapframe *tf)
     if(myproc()->killed)
       exit();
     return;
+  }
+  if (tf->trapno == T_PGFLT) {  // Page fault
+    uint va = rcr2(); // Faulting virtual address
+    pte_t *pte = walkpgdir(myproc()->pgdir, (void*)va, 0);
+
+    if (pte && (*pte & PTE_COW)) {  // Check if it's a COW page
+      char *mem = kalloc();
+      if (mem == 0)
+        panic("Out of memory");
+
+      memmove(mem, (char*)P2V(PTE_ADDR(*pte)), PGSIZE); // Copy old page data
+      acquire(&kmem.lock);
+      *pte = V2P(mem) | PTE_U | PTE_W | PTE_P; // Update page table entry
+      acquire(&kmem.lock);
+      
+      decref((char*)P2V(PTE_ADDR(*pte))); // Decrease reference count of old page
+      
+      return;
+    }
   }
 
   switch(tf->trapno){
@@ -57,36 +99,6 @@ trap(struct trapframe *tf)
     }
     lapiceoi();
     break;
-    case T_PGFLT:  
-  {
-    uint va = rcr2();  
-    pte_t *pte = walk(p->pgdir, va, 0);
-
-    if(pte == 0 || (*pte & PTE_V) == 0){  
-      p->killed = 1;
-      break;
-    }
-
-    uint pa = PTE2PA(*pte);
-
-    if((*pte & PTE_W) == 0){  
-      char *mem = kalloc();
-      if(mem == 0){  
-        p->killed = 1;
-        break;
-      }
-
-      memmove(mem, (char *)pa, PGSIZE);  
-
-      uvmunmap(p->pgdir, va, 1, 0);  
-      mappages(p->pgdir, va, PGSIZE, (uint)mem, PTE_W | PTE_R | PTE_U | PTE_V);
-
-      dec_refcount(pa);  
-      break;
-    }
-    p->killed = 1;
-    break;
-  }
   case T_IRQ0 + IRQ_IDE:
     ideintr();
     lapiceoi();
